@@ -85,7 +85,12 @@ class _Linear(torch.autograd.Function):
         # Make sure input dimensions are compatible
         in_features = weight.shape[-1]
         assert inp.shape[-1] == in_features, "GEMM not possible"
-        inputmat = inp.view((-1, in_features))
+        fp8_input = isinstance(inp, Float8Tensor)
+        inputmat = None
+        if fp8_input:
+            inputmat = inp._data.view((-1, in_features))
+        else:
+            inputmat = inp.view((-1, in_features))
         if fp8:
             assert_dim_for_fp8_exec(inputmat)
             assert_dim_for_fp8_exec(weight)
@@ -95,7 +100,8 @@ class _Linear(torch.autograd.Function):
         ub_overlap_rs = False if tp_world_size == 1 else ub_overlap_rs
 
         # Cast input to expected dtype
-        inputmat = cast_if_needed(inputmat, activation_dtype)
+        if not fp8_input:
+            inputmat = cast_if_needed(inputmat, activation_dtype)
         inputmat_t = None
         inputmat_no_fp8 = inputmat
         if fp8:
@@ -107,20 +113,24 @@ class _Linear(torch.autograd.Function):
                 and not sequence_parallel
             ):
                 # FP8 input for forward, FP8 input transpose for backward wgrad
-                inputmat, inputmat_t = fp8_cast_transpose_fused(
-                    inputmat,
-                    fp8_meta["scaling_fwd"],
-                    tex.FP8FwdTensors.GEMM1_INPUT,
-                    fp8_dtype_forward,
-                )
+                if fp8_input:
+                    inputmat_t = tex.fp8_transpose(inputmat, fp8_dtype_forward)
+                else:
+                    inputmat, inputmat_t = fp8_cast_transpose_fused(
+                        inputmat,
+                        fp8_meta["scaling_fwd"],
+                        tex.FP8FwdTensors.GEMM1_INPUT,
+                        fp8_dtype_forward,
+                    )
             else:
                 # FP8 input for forward
-                inputmat = cast_to_fp8(
-                    inputmat,
-                    fp8_meta["scaling_fwd"],
-                    tex.FP8FwdTensors.GEMM1_INPUT,
-                    fp8_dtype_forward,
-                )
+                if not fp8_input:
+                    inputmat = cast_to_fp8(
+                        inputmat,
+                        fp8_meta["scaling_fwd"],
+                        tex.FP8FwdTensors.GEMM1_INPUT,
+                        fp8_dtype_forward,
+                    )
 
         # Column Parallel Linear
         if parallel_mode == "column" and sequence_parallel:
