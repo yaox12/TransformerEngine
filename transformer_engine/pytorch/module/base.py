@@ -31,9 +31,12 @@ from ..distributed import (
     get_distributed_world_size,
 )
 from ..cpp_extensions import (
+    cast_to_fp8,
+    cast_from_fp8,
     fp8_cast_transpose_fused,
     fp8_cast_transpose_bgrad_fused,
-    cast_to_fp8,
+    fp8_transpose,
+    fp8_transpose_bgrad_fused,
 )
 from ..constants import dist_group_type
 from ..float8_tensor import Float8Tensor
@@ -657,6 +660,11 @@ class TransformerEngineBaseModule(torch.nn.Module, ABC):
             R4: bias gradient on R1.
 
         """
+        fp8_grad = isinstance(grad_output, Float8Tensor)
+        if fp8_grad:
+            ctx.fp8_meta["scaling_bwd"].scale_inv[tex.FP8BwdTensors.GRAD_OUTPUT1] = grad_output._scale_inv
+            nominal_dtype = grad_output.dtype
+            grad_output = grad_output._data
         grad_output = grad_output.contiguous()
         grad_output_mat = grad_output.view((-1, grad_output.shape[-1]))
         gather_grad_output = row_parallel_mode and ctx.sequence_parallel
@@ -713,13 +721,49 @@ class TransformerEngineBaseModule(torch.nn.Module, ABC):
             return grad_output_mat, grad_output_c, grad_output_t, grad_bias
 
         # FP8 case without gather: cast, transpose, bgrad fused
-        if ctx.use_bias:
+        if ctx.use_bias and not fp8_grad:
             grad_bias, grad_output_c, grad_output_t = fp8_cast_transpose_bgrad_fused(
                 grad_output_mat,
                 ctx.fp8_meta["scaling_bwd"],
                 tex.FP8BwdTensors.GRAD_OUTPUT1,
                 fp8_dtype_backward,
             )
+        elif ctx.use_bias and fp8_grad:
+            grad_output_c = grad_output_mat
+            grad_bias, grad_output_t = fp8_transpose_bgrad_fused(
+                grad_output_c,
+                ctx.fp8_meta["scaling_bwd"],
+                tex.FP8BwdTensors.GRAD_OUTPUT1,
+                fp8_dtype_backward,
+                ctx.bias_dtype,
+            )
+            grad_output_mat = None
+            if ctx.fp8_meta["recipe"].override_linear_precision.wgrad:
+                grad_output_mat = cast_from_fp8(
+                    grad_output_c,
+                    ctx.fp8_meta["scaling_bwd"],
+                    tex.FP8BwdTensors.GRAD_OUTPUT1,
+                    fp8_dtype_backward,
+                    nominal_dtype,
+                )
+        elif not ctx.use_bias and fp8_grad:
+            grad_output_c = grad_output_mat
+            grad_bias = None
+            if ctx.fp8_meta["recipe"].override_linear_precision.wgrad:
+                grad_output_mat = cast_from_fp8(
+                    grad_output_c,
+                    ctx.fp8_meta["scaling_bwd"],
+                    tex.FP8BwdTensors.GRAD_OUTPUT1,
+                    fp8_dtype_backward,
+                    nominal_dtype,
+                )
+                grad_output_t = None
+            else:
+                grad_output_mat = None
+                if grad_output_c.numel() == 0:
+                    grad_output_t = grad_output_c
+                else:
+                    grad_output_t = fp8_transpose(grad_output_c, fp8_dtype_backward)
         else:
             if not ctx.fp8_meta["recipe"].override_linear_precision.wgrad:
                 grad_output_c, grad_output_t = fp8_cast_transpose_fused(

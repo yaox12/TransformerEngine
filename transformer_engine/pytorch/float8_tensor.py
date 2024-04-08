@@ -646,7 +646,11 @@ class Float8Tensor(torch.Tensor):
         # Slice op
         # TODO Consider additional bookkeeping so we invalidate caches # pylint: disable=fixme
         # if these slices are modified in-place
-        if func == aten.slice.Tensor:
+        if func in (
+            aten.slice.Tensor,
+            aten.index_select.default,
+            aten.slice_backward.default,
+        ):
             tensor = args[0]
             data = tensor._data
             data_slice = data.__torch_dispatch__(
@@ -656,6 +660,76 @@ class Float8Tensor(torch.Tensor):
                 kwargs,
             )
             return Float8Tensor.make_like(tensor, data=data_slice)
+
+        # View op
+        if func in (
+            aten.view.default,
+            aten.squeeze.default,
+            aten.unsqueeze.default,
+            aten.expand.default,
+            aten.as_strided.default,
+        ):
+            tensor = args[0]
+            data = tensor._data
+            data_view = data.__torch_dispatch__(
+                func,
+                types,
+                [data] + list(args[1:]),
+                kwargs,
+            )
+            return Float8Tensor.make_like(
+                tensor,
+                data=data_view,
+                fp8_attrs=tensor._fp8_attrs,
+            )
+
+        if func in (
+            aten.zeros_like.default,
+            aten.ones_like.default,
+            aten.empty_like.default,
+            aten.new_empty_strided.default,
+        ):
+            tensor = args[0]
+            data = tensor._data
+            out = data.__torch_dispatch__(
+                func,
+                types,
+                [data] + list(args[1:]),
+                kwargs,
+            )
+            if kwargs.get("dtype", None) is None:
+                return Float8Tensor.make_like(tensor, data=out)
+            return out
+
+        if func == aten.cat.default:
+            tensor_list = args[0]
+            tensor = None
+            for i, t in enumerate(tensor_list):
+                if isinstance(t, Float8Tensor):
+                    tensor_list[i] = t._data
+                    tensor = t
+            output = tensor._data.__torch_dispatch__(
+                func,
+                types,
+                [tensor_list] + list(args[1:]),
+                kwargs,
+            )
+            return Float8Tensor.make_like(tensor, data=output)
+
+        if func == aten.split.Tensor:
+            tensor = args[0]
+            data = tensor._data
+            tensor_tuple = data.__torch_dispatch__(
+                func,
+                types,
+                [data] + list(args[1:]),
+                kwargs,
+            )
+            return tuple(Float8Tensor.make_like(tensor, data=t) for t in tensor_tuple)
+
+        # if func == aten.size.default:
+        #     tensor = args[0]
+        #     return tensor._data.__torch_dispatch__(func, types, args, kwargs)
 
         # Detach op
         if func == aten.detach.default:
@@ -768,3 +842,6 @@ class Float8Tensor(torch.Tensor):
 
     # Do not force the Float8Tensor type on the returned tensor
     __torch_function__ = torch._C._disabled_torch_function_impl
+
+    # Class attribute to check for Float8Tensor
+    _is_float8_tensor: bool = True

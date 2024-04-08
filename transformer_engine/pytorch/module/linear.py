@@ -89,6 +89,7 @@ class _Linear(torch.autograd.Function):
         inputmat = None
         if fp8_input:
             inputmat = inp._data.view((-1, in_features))
+            fp8_meta["scaling_fwd"].scale_inv[tex.FP8FwdTensors.GEMM1_INPUT] = inp._scale_inv
         else:
             inputmat = inp.view((-1, in_features))
         if fp8:
@@ -113,9 +114,7 @@ class _Linear(torch.autograd.Function):
                 and not sequence_parallel
             ):
                 # FP8 input for forward, FP8 input transpose for backward wgrad
-                if fp8_input:
-                    inputmat_t = tex.fp8_transpose(inputmat, fp8_dtype_forward)
-                else:
+                if not fp8_input:
                     inputmat, inputmat_t = fp8_cast_transpose_fused(
                         inputmat,
                         fp8_meta["scaling_fwd"],

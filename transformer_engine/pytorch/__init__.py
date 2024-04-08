@@ -9,6 +9,7 @@ from .module import LayerNormMLP
 from .module import LayerNorm
 from .module import RMSNorm
 from .module import NormCast
+from .module import BackwardCast
 from .attention import DotProductAttention
 from .attention import InferenceParams
 from .attention import MultiheadAttention
