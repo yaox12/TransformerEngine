@@ -480,7 +480,7 @@ class _Linear(torch.autograd.Function):
                         fwd_scale_inverses,
                         tex.FP8FwdTensors.GEMM1_WEIGHT,
                         fp8_dtype_forward,
-                        grad_output_c,
+                        grad_output_c._data if isinstance(grad_output_c, Float8Tensor) else grad_output_c,
                         ctx.fp8_meta["scaling_bwd"].scale_inv,
                         tex.FP8BwdTensors.GRAD_OUTPUT1,
                         fp8_dtype_backward,
