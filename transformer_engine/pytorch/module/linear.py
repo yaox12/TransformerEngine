@@ -466,7 +466,8 @@ class _Linear(torch.autograd.Function):
                     if _NVTE_DEBUG:
                         print('[Linear]: using FP8 backward')
 
-                    if ctx.is_input_fp8:
+                    # TODO(Xin): WAR for MoE FP8
+                    if ctx.is_input_fp8 and ctx.fp8_meta["recipe"].fp8_mha:
                         out_index, meta_tensor, output_te_dtype, output_dtype = (
                             tex.FP8BwdTensors.GRAD_INPUT1,
                             ctx.fp8_meta["scaling_bwd"],
