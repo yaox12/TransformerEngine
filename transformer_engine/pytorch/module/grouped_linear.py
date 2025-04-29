@@ -301,7 +301,7 @@ class _GroupedLinear(torch.autograd.Function):
                     new_rowwise_data = rowwise_mats[i]
                     new_rowwise_scale_inv = rowwise_scale_inv_mats[i]
                     new_columnwise_data = torch.empty(
-                        new_rowwise_data.T.shape, device=new_rowwise_data.device
+                        new_rowwise_data.T.shape, device=new_rowwise_data.device, dtype=new_rowwise_data.dtype
                     )
                     new_columnwise_scale_inv_shape = [
                         (new_columnwise_data.shape[1] + 128 - 1) // 128,
