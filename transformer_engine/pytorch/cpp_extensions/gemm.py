@@ -202,7 +202,8 @@ def general_grouped_gemm(
         workspaces[0].shape[0],
         accumulate,
         use_split_accumulator,
-        sm_count - int(os.getenv("NVTE_EXT_MARGIN_SM", str(sm_count))),
+        # sm_count - int(os.getenv("NVTE_EXT_MARGIN_SM", str(sm_count))),
+        sm_count,
     )
 
     return out, bias, gelu_input
