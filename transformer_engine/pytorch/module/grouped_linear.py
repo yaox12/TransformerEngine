@@ -206,10 +206,10 @@ class _GroupedLinear(torch.autograd.Function):
                             inputmat.update_usage(rowwise_usage=False, columnwise_usage=True)
             else:
                 inputmats = [None] * num_gemms
-            if inp.requires_grad:
-                for weight in weights_fp8:
-                    if isinstance(weight, QuantizedTensorBase):
-                        weight.update_usage(columnwise_usage=True)
+            # if inp.requires_grad:
+            #     for weight in weights_fp8:
+            #         if isinstance(weight, QuantizedTensorBase):
+            #             weight.update_usage(columnwise_usage=True)
 
             tensors_to_save, tensor_objects = prepare_for_saving(
                 *inputmats,
@@ -737,10 +737,10 @@ class GroupedLinear(TransformerEngineBaseModule):
         ), "GroupedLinear doesn't support input tensor in FP8."
         assert len(m_splits) == self.num_gemms, "Number of splits should match number of GEMMs."
 
-        if FP8GlobalStateManager.fp8_graph_capturing():
-            skip_fp8_weight_update = FP8GlobalStateManager.get_skip_fp8_weight_update_tensor()
-        else:
-            skip_fp8_weight_update = None
+        # if FP8GlobalStateManager.fp8_graph_capturing():
+        #     skip_fp8_weight_update = FP8GlobalStateManager.get_skip_fp8_weight_update_tensor()
+        # else:
+        skip_fp8_weight_update = None
         if skip_fp8_weight_update is not None:
             is_first_microbatch = False
 

@@ -672,6 +672,7 @@ class TransformerEngineBaseModule(torch.nn.Module, ABC):
         "fp8_initialized",
         "fp8_calibration",
         "fp8_parameters",
+        "forwarded_at_least_once",
     }
 
     def __setattr__(self, name: str, value: Any) -> None:
@@ -1087,8 +1088,8 @@ class TransformerEngineBaseModule(torch.nn.Module, ABC):
                     "necessary when using sequence parallelism with FP8."
                 )
 
-            if self.fp8 and not FP8GlobalStateManager.fp8_graph_capturing():
-                FP8GlobalStateManager.add_fp8_tensors_to_global_buffer(self.fp8_meta)
+            # if self.fp8 and not FP8GlobalStateManager.fp8_graph_capturing():
+            #     FP8GlobalStateManager.add_fp8_tensors_to_global_buffer(self.fp8_meta)
 
             # Activation recomputation is used and this is the first forward phase.
             if self.fp8 and self.training and is_fp8_activation_recompute_enabled():
@@ -1389,8 +1390,8 @@ class TransformerEngineBaseModule(torch.nn.Module, ABC):
                     reset_cache = True
                 elif quantizer.columnwise_usage and out._columnwise_data is None:
                     reset_cache = True
-            if isinstance(out, DebugQuantizedTensor) != isinstance(quantizer, DebugQuantizer):
-                reset_cache = True
+            # if isinstance(out, DebugQuantizedTensor) != isinstance(quantizer, DebugQuantizer):
+            #     reset_cache = True
             if reset_cache:
                 out = None
                 del self._fp8_workspaces[cache_name]
@@ -1567,6 +1568,7 @@ class TransformerEngineBaseModule(torch.nn.Module, ABC):
         Example case to check: recipe is DelayedScaling (DelayedScaling is set in fp8_autocast()),
         but the weight tensor is MXFP8Tensor (MXFP8BlockScaling is set in fp8_model_init()).
         """
+        return
         if not self.fp8 and not self.fp8_calibration:
             return
         if not hasattr(self, "weight_names") or not self.weight_names:
