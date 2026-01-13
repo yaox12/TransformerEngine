@@ -35,25 +35,6 @@ SM100 tcgen05.mma instructions operate as follows:
 - Write accumulator to TMEM
 The accumulator in TMEM must then be loaded to registers before writing back to GMEM.
 
-.. code-block:: bash
-
-    python examples/blackwell/blockwise_gemm/blockwise_gemm.py                  \
-      --ab_dtype Float8E4M3FN --c_dtype BFloat16 --acc_dtype Float32            \
-      --scale_dtype Float32                                                     \
-      --mma_tiler_mn 128,128 --cluster_shape_mn 1,2                             \
-      --mnkl 4096,4096,4096,4
-
-To collect performance with NCU profiler:
-
-.. code-block:: bash
-
-    ncu python examples/blackwell/blockwise_gemm/blockwise_gemm.py              \
-      --ab_dtype Float8E4M3FN --c_dtype BFloat16 --acc_dtype Float32            \
-      --scale_dtype Float32                                                     \
-      --mma_tiler_mn 128,128 --cluster_shape_mn 1,2                             \
-      --mnkl 4096,4096,4096,4
-
-
 Constraints are same as dense_gemm.py:
 * Supported input data types: fp8 (e4m3fn)
   see detailed valid dtype combinations in below BlockwiseGemmKernel class documentation
