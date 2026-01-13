@@ -66,21 +66,18 @@ Constraints are same as dense_gemm.py:
 """
 
 from typing import Type, Tuple, Union
+from functools import lru_cache
 
 import cuda.bindings.driver as cuda
-import torch
-
 import cutlass
 import cutlass.cute as cute
-from cutlass.cute.runtime import from_dlpack
+from cutlass.cute.runtime import make_fake_compact_tensor
 from cutlass.cute.nvgpu import cpasync, tcgen05
 import cutlass.utils as utils
 import cutlass.pipeline as pipeline
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 import cutlass.utils.blackwell_helpers as sm100_utils
-
 import math
-
 import torch
 from transformer_engine.pytorch.tensor.storage.float8_blockwise_tensor_storage import (
     Float8BlockwiseQTensorStorage,
@@ -2542,14 +2539,12 @@ te_dtype_to_cutlass_dtype = {
 }
 
 
-def to_cute_tensor(t, element_type=None, assumed_align=16, leading_dim=-1, enable_tvm_ffi=True):
-    """Convert torch tensor to cute tensor for TVM FFI. leading_dim=-1 defaults to t.ndim-1."""
-    tensor = from_dlpack(t, assumed_align=assumed_align, enable_tvm_ffi=enable_tvm_ffi)
-    if element_type is not None:
-        tensor.element_type = element_type
-    if leading_dim == -1:
-        leading_dim = t.ndim - 1
-    return tensor.mark_layout_dynamic(leading_dim=leading_dim)
+@lru_cache
+def get_max_active_clusters(cluster_size: int) -> int:
+    """
+    Get the maximum number of active clusters for the given cluster size.
+    """
+    return cutlass.utils.HardwareInfo().get_max_active_clusters(cluster_size)
 
 
 _blockwise_gemm_sm100_compile_cache = {}
@@ -2622,12 +2617,6 @@ def blockwise_gemm_sm100(
         *mma_tiler_mn,
         *cluster_shape_mn,
     )
-    cuda_stream = cuda.CUstream(stream.cuda_stream)
-    a_cute = to_cute_tensor(a_data, ab_dtype)
-    a_scale_cute = to_cute_tensor(a_scale_inv.permute(1, 0), leading_dim=0)
-    b_cute = to_cute_tensor(b_data, ab_dtype)
-    b_scale_cute = to_cute_tensor(b_scale_inv)
-    out_cute = to_cute_tensor(out)
 
     if compile_key not in _blockwise_gemm_sm100_compile_cache:
 
@@ -2635,10 +2624,28 @@ def blockwise_gemm_sm100(
         gemm = BlockwiseGemmKernel(acc_dtype, use_2cta_instrs, mma_tiler_mn, cluster_shape_mn)
 
         # Compute max active clusters on current device
-        hardware_info = cutlass.utils.HardwareInfo()
-        max_active_clusters = hardware_info.get_max_active_clusters(
-            cluster_shape_mn[0] * cluster_shape_mn[1]
+        max_active_clusters = get_max_active_clusters(cluster_shape_mn[0] * cluster_shape_mn[1])
+
+        m, n, k = (
+            cute.sym_int(divisibility=16),
+            cute.sym_int(divisibility=16),
+            cute.sym_int(divisibility=16),
         )
+        a_cute = make_fake_compact_tensor(ab_dtype, (m, k), stride_order=(1, 0), assumed_align=16)
+        # (math.ceil(k / 128), m), m should be divisible by 4
+        a_scale_cute = make_fake_compact_tensor(
+            cutlass.Float32, (m, cute.sym_int()), stride_order=(0, 1), assumed_align=16
+        )
+        b_cute = make_fake_compact_tensor(ab_dtype, (n, k), stride_order=(1, 0), assumed_align=16)
+        # (math.ceil(n / 128), math.ceil(k / 128)), math.ceil(k / 128) should be divisible by 4
+        b_scale_cute = make_fake_compact_tensor(
+            cutlass.Float32,
+            (cute.sym_int(), cute.sym_int(divisibility=4)),
+            stride_order=(1, 0),
+            assumed_align=16,
+        )
+        out_cute = make_fake_compact_tensor(c_dtype, (m, n), stride_order=(1, 0), assumed_align=16)
+        fake_stream = cute.runtime.make_fake_stream()
 
         # Compile gemm kernel
         _blockwise_gemm_sm100_compile_cache[compile_key] = cute.compile(
@@ -2649,18 +2656,18 @@ def blockwise_gemm_sm100(
             a_scale_cute,
             b_scale_cute,
             max_active_clusters,
-            cuda_stream,
+            fake_stream,
             options="--enable-tvm-ffi",
         )
 
     compiled_gemm = _blockwise_gemm_sm100_compile_cache[compile_key]
     compiled_gemm(
-        a_cute,
-        b_cute,
-        out_cute,
-        a_scale_cute,
-        b_scale_cute,
-        cuda_stream,
+        a_data.view(torch.float8_e4m3fn),
+        b_data.view(torch.float8_e4m3fn),
+        out,
+        a_scale_inv.permute(1, 0),
+        b_scale_inv,
+        stream,
     )
 
 
