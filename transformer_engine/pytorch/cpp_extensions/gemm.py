@@ -291,8 +291,9 @@ def general_grouped_gemm(
     ):
         assert not gelu, "GELU not supported in FP8 blockwise gemm with f32 scales."
         assert not use_bias, "bias not supported in FP8 blockwise gemm with f32 scales."
-        blockwise_grouped_gemm_sm100(A, transa, B, transb, out, out_dtype, m_splits, accumulate)
-        # return out, bias, gelu_input
+        # Swap A/B for cuteDSL kernels
+        blockwise_grouped_gemm_sm100(B, transb, A, transa, out, out_dtype, m_splits, accumulate)
+        return out, bias, gelu_input
 
     bias = tex.te_general_grouped_gemm(
         A,

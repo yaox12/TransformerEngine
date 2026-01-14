@@ -2538,11 +2538,14 @@ def blockwise_gemm_sm100(
     transb: bool,
     out: torch.Tensor,
     out_dtype: tex.DType,
+    is_dw: bool,
     accumulate: bool,
     stream: torch.cuda.Stream,
 ):
     """
     Blockwise GEMM with FP8 inputs and f32 scales.
+
+    Note that the A/B are swapped for cuteDSL kernels.
     """
     assert a._fp8_dtype == tex.DType.kFloat8E4M3
     assert b._fp8_dtype == tex.DType.kFloat8E4M3
@@ -2589,7 +2592,7 @@ def blockwise_gemm_sm100(
     ):
         raise TypeError(
             f"Unsupported case {ab_dtype=}, {acc_dtype=}, {c_dtype=}, {use_2cta_instrs=},"
-            f" {mma_tiler_mn=}, {cluster_shape_mn=}"
+            f" {mma_tiler_mn=}, {cluster_shape_mn=}, {m=}, {n=}, {k=}."
         )
 
     compile_key = (
@@ -2597,12 +2600,15 @@ def blockwise_gemm_sm100(
         use_2cta_instrs,
         *mma_tiler_mn,
         *cluster_shape_mn,
+        is_dw,
     )
 
     if compile_key not in _blockwise_gemm_sm100_compile_cache:
 
         # Configure gemm kernel
-        gemm = BlockwiseGemmKernel(acc_dtype, use_2cta_instrs, mma_tiler_mn, cluster_shape_mn)
+        gemm = BlockwiseGemmKernel(
+            acc_dtype, use_2cta_instrs, mma_tiler_mn, cluster_shape_mn, is_dw
+        )
 
         # Compute max active clusters on current device
         max_active_clusters = get_max_active_clusters(cluster_shape_mn[0] * cluster_shape_mn[1])
@@ -2613,18 +2619,27 @@ def blockwise_gemm_sm100(
             cute.sym_int(divisibility=16),
         )
         a_cute = make_fake_compact_tensor(ab_dtype, (m, k), stride_order=(1, 0), assumed_align=16)
-        # (math.ceil(k / 128), m), m should be divisible by 4
+        # (math.ceil(k / 128), m), m should be divisible by 4 (already divisible by 16)
         a_scale_cute = make_fake_compact_tensor(
             cutlass.Float32, (m, cute.sym_int()), stride_order=(0, 1), assumed_align=16
         )
         b_cute = make_fake_compact_tensor(ab_dtype, (n, k), stride_order=(1, 0), assumed_align=16)
-        # (math.ceil(n / 128), math.ceil(k / 128)), math.ceil(k / 128) should be divisible by 4
-        b_scale_cute = make_fake_compact_tensor(
-            cutlass.Float32,
-            (cute.sym_int(), cute.sym_int(divisibility=4)),
-            stride_order=(1, 0),
-            assumed_align=16,
-        )
+        if not is_dw:
+            # (math.ceil(n / 128), math.ceil(k / 128)), math.ceil(k / 128) should be divisible by 4
+            b_scale_cute = make_fake_compact_tensor(
+                cutlass.Float32,
+                (cute.sym_int(), cute.sym_int(divisibility=4)),
+                stride_order=(1, 0),
+                assumed_align=16,
+            )
+        else:
+            # (math.ceil(k / 128), n), n should be divisible by 4 (already divisible by 16)
+            b_scale_cute = make_fake_compact_tensor(
+                cutlass.Float32,
+                (n, cute.sym_int()),
+                stride_order=(0, 1),
+                assumed_align=16,
+            )
         out_cute = make_fake_compact_tensor(c_dtype, (m, n), stride_order=(1, 0), assumed_align=16)
         fake_stream = cute.runtime.make_fake_stream()
 
@@ -2647,7 +2662,7 @@ def blockwise_gemm_sm100(
         b_data.view(torch.float8_e4m3fn),
         out,
         a_scale_inv.permute(1, 0),
-        b_scale_inv,
+        b_scale_inv.permute(1, 0) if is_dw else b_scale_inv,
         stream,
     )
 
@@ -2669,28 +2684,33 @@ def blockwise_grouped_gemm_sm100(
 ):
     """
     Blockwise grouped GEMM with FP8 inputs and f32 scales.
+
+    Note that the A/B are swapped for cuteDSL kernels.
     """
+    assert not (transa and transb), "TT layout is not supported."
+    is_dw = transa and not transb
     assert len(a_list) == len(b_list)
     num_gemms = len(a_list)
+    if not is_dw:
+        out = torch.split(out[0], m_splits)
+    assert len(out) == num_gemms
+
     num_stream_used = min(num_streams, num_gemms)
     # wait for current stream to finish
     current_stream = torch.cuda.current_stream()
     events[0].record(current_stream)
     for s in range(num_stream_used):
         streams[s].wait_event(events[0])
-    if len(out) == 1:
-        out = torch.split(out[0], m_splits)
-    assert len(out) == num_gemms
     # launch gemms
     for i in range(num_gemms):
-        # swap A/B
         blockwise_gemm_sm100(
-            b_list[i],
-            transb,
             a_list[i],
             transa,
+            b_list[i],
+            transb,
             out[i],
             out_dtype,
+            is_dw,
             accumulate,
             streams[i % num_streams],
         )
