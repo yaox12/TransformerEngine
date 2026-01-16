@@ -4,6 +4,7 @@
 import pytest
 import torch
 
+from transformer_engine.pytorch.constants import TE_DType
 from transformer_engine.pytorch.cpp_extensions.blockwise_gemm_sm100 import (
     blockwise_gemm_sm100,
     blockwise_grouped_gemm_sm100,
@@ -18,7 +19,8 @@ import transformer_engine_torch as tex
 @pytest.mark.parametrize("k", [7168])
 @pytest.mark.parametrize("n", [4096])
 @pytest.mark.parametrize("layout", ["TN", "NN", "NT"])
-def test_blockwise_grouped_gemm_sm100(layout, num_gemms, m, k, n):
+@pytest.mark.parametrize("accumulate", [True, False])
+def test_blockwise_grouped_gemm_sm100(layout, num_gemms, m, k, n, accumulate):
     # we use force_pow_2_scales=True, so we can use cublas as a reference.
     quantizer_2d = Float8BlockQuantizer(
         fp8_dtype=tex.DType.kFloat8E4M3,
@@ -36,6 +38,7 @@ def test_blockwise_grouped_gemm_sm100(layout, num_gemms, m, k, n):
     m_splits = [m] * num_gemms
     transa = layout[0] == "T"
     transb = layout[1] == "T"
+    out_dtype = torch.float32 if accumulate else torch.bfloat16
 
     if layout == "TN":
         # weights
@@ -49,8 +52,8 @@ def test_blockwise_grouped_gemm_sm100(layout, num_gemms, m, k, n):
             for m in m_splits
         ]
 
-        out_ref = [torch.empty(sum(m_splits), n, dtype=torch.bfloat16, device="cuda")]
-        out = [torch.empty(sum(m_splits), n, dtype=torch.bfloat16, device="cuda")]
+        out_ref = [torch.empty(sum(m_splits), n, dtype=out_dtype, device="cuda")]
+        out = [t.detach().clone() for t in out_ref]
     elif layout == "NN":
         # weights
         a_list = [
@@ -63,8 +66,8 @@ def test_blockwise_grouped_gemm_sm100(layout, num_gemms, m, k, n):
             for m in m_splits
         ]
 
-        out_ref = [torch.empty(sum(m_splits), k, dtype=torch.bfloat16, device="cuda")]
-        out = [torch.empty(sum(m_splits), k, dtype=torch.bfloat16, device="cuda")]
+        out_ref = [torch.empty(sum(m_splits), k, dtype=out_dtype, device="cuda")]
+        out = [t.detach().clone() for t in out_ref]
     elif layout == "NT":
         # inputs
         a_list = [
@@ -77,11 +80,11 @@ def test_blockwise_grouped_gemm_sm100(layout, num_gemms, m, k, n):
             for m in m_splits
         ]
 
-        out_ref = [torch.empty(n, k, dtype=torch.bfloat16, device="cuda") for _ in range(num_gemms)]
-        out = [torch.empty(n, k, dtype=torch.bfloat16, device="cuda") for _ in range(num_gemms)]
+        out_ref = [torch.empty(n, k, dtype=out_dtype, device="cuda") for _ in range(num_gemms)]
+        out = [t.detach().clone() for t in out_ref]
 
     blockwise_grouped_gemm_sm100(
-        b_list, transb, a_list, transa, out, tex.DType.kBFloat16, m_splits, accumulate=False
+        b_list, transb, a_list, transa, out, TE_DType[out_dtype], m_splits, accumulate=accumulate
     )
 
     # since we don't initialize fp8 recipe here, so this function will dispatch to
@@ -91,10 +94,11 @@ def test_blockwise_grouped_gemm_sm100(layout, num_gemms, m, k, n):
         b_list,
         out_ref,
         [None] * num_gemms,
-        torch.bfloat16,
+        out_dtype,
         layout=layout,
         m_splits=m_splits,
         single_output=(layout != "NT"),
+        accumulate=accumulate,
     )
 
     torch.testing.assert_close(out, out_ref, atol=1e-2, rtol=1e-2)

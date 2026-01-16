@@ -352,6 +352,7 @@ class BlockwiseGemmKernel:
         c: cute.Tensor,
         sfa: cute.Tensor,
         sfb: cute.Tensor,
+        beta: cutlass.Constexpr,
         max_active_clusters: cutlass.Constexpr,
         stream: cuda.CUstream,
         epilogue_op: cutlass.Constexpr = lambda x: x,
@@ -524,8 +525,14 @@ class BlockwiseGemmKernel:
         tma_tensor_c = None
         c_cta_v_layout = cute.composition(cute.make_identity_layout(c.shape), self.epi_tile)
         epi_smem_layout = cute.slice_(self.c_smem_layout_staged, (None, None, 0))
+        # beta is a compile-time parameter:
+        # - beta == 0: C = A*B (overwrite C)
+        # - beta == 1: C = A*B + C (accumulate into existing C)
+        tma_store_op_c = cpasync.CopyBulkTensorTileS2GOp()
+        if cutlass.const_expr(beta == 1):
+            tma_store_op_c = cpasync.CopyReduceBulkTensorTileS2GOp()
         tma_atom_c, tma_tensor_c = cpasync.make_tiled_tma_atom(
-            cpasync.CopyBulkTensorTileS2GOp(),
+            tma_store_op_c,
             c,
             epi_smem_layout,
             c_cta_v_layout,
@@ -1535,15 +1542,6 @@ class BlockwiseGemmKernel:
                 # initialize the final accumulator
                 tTR_rAcc_final.fill(0.0)
 
-                tTR_rSFA = cute.make_rmem_tensor(
-                    cute.slice_(tTR_sSFA, (None, None, None, 0, None, 0)).shape,
-                    self.acc_dtype,
-                )
-                tTR_rSFB = cute.make_rmem_tensor(
-                    cute.slice_(tTR_sSFB, (None, None, None, 0, None, 0)).shape,
-                    self.acc_dtype,
-                )
-
                 scale_consumer_state.reset_count()
                 peek_scale_full_status = cutlass.Boolean(1)
                 if scale_consumer_state.count < k_tile_cnt:
@@ -1581,9 +1579,6 @@ class BlockwiseGemmKernel:
                         num_bits_per_copy=self.acc_dtype.width,
                     )
 
-                    cute.copy(scale_atom_copy, tTR_sSFA_slice, tTR_rSFA)
-                    cute.copy(scale_atom_copy, tTR_sSFB_slice, tTR_rSFB)
-
                     #
                     # Wait for accumulator buffer full
                     #
@@ -1607,14 +1602,25 @@ class BlockwiseGemmKernel:
                         # Update accumulator by scale factor
                         #
                         tTR_rAcc_subtile = tTR_rAcc_final[(None, None, None, subtile_idx)]
-                        tTR_rSFA_subtile = tTR_rSFA[(None, None, None, subtile_idx)]
-                        tTR_rSFB_subtile = tTR_rSFB[(None, None, None, subtile_idx)]
+                        # Load scale factors for *this* subtile into short-lived rmem,
+                        # to reduce register live range (especially important in DW mode).
+                        tTR_sSFA_subtile = tTR_sSFA_slice[(None, None, None, subtile_idx)]
+                        tTR_sSFB_subtile = tTR_sSFB_slice[(None, None, None, subtile_idx)]
 
+                        # smem -> short-lived rmem -> load()
+                        tTR_rSFA_subtile = cute.make_rmem_tensor(
+                            tTR_sSFA_subtile.shape, self.acc_dtype
+                        )
+                        tTR_rSFB_subtile = cute.make_rmem_tensor(
+                            tTR_sSFB_subtile.shape, self.acc_dtype
+                        )
+                        cute.copy(scale_atom_copy, tTR_sSFA_subtile, tTR_rSFA_subtile)
+                        cute.copy(scale_atom_copy, tTR_sSFB_subtile, tTR_rSFB_subtile)
+                        scale = tTR_rSFA_subtile.load() * tTR_rSFB_subtile.load()
+
+                        # Original (baseline) update: keep explicit acc/final vectors.
                         acc_vec = tTR_rAcc.load()
                         final_vec = tTR_rAcc_subtile.load()
-                        scale_a = tTR_rSFA_subtile.load()
-                        scale_b = tTR_rSFB_subtile.load()
-                        scale = scale_a * scale_b
                         final_vec = acc_vec * scale + final_vec
                         tTR_rAcc_subtile.store(final_vec.to(self.acc_dtype))
 
@@ -2574,6 +2580,7 @@ def blockwise_gemm_sm100(
     use_2cta_instrs = False
     mma_tiler_mn = (128, 128)
     cluster_shape_mn = (1, 2)
+    beta = 1 if accumulate else 0
 
     if not BlockwiseGemmKernel.can_implement(
         ab_dtype=ab_dtype,
@@ -2601,6 +2608,7 @@ def blockwise_gemm_sm100(
         *mma_tiler_mn,
         *cluster_shape_mn,
         is_dw,
+        beta,
     )
 
     if compile_key not in _blockwise_gemm_sm100_compile_cache:
@@ -2651,6 +2659,7 @@ def blockwise_gemm_sm100(
             out_cute,
             a_scale_cute,
             b_scale_cute,
+            beta,
             max_active_clusters,
             fake_stream,
             options="--enable-tvm-ffi",
