@@ -10,14 +10,15 @@ import functools
 import torch
 import transformer_engine_torch as tex
 from ..constants import TE_DType
-from ..utils import get_sm_count, _empty_tensor
+from ..utils import get_sm_count, _empty_tensor, get_device_compute_capability
 
 from ..quantized_tensor import Quantizer
 from ..tensor.storage.float8_blockwise_tensor_storage import Float8BlockwiseQTensorStorage
 from ..tensor.utils import is_custom
 from ..custom_recipes.gemm import custom_gemm
 from ...debug.pytorch.debug_quantization import DebugQuantizer
-
+from ..quantization import FP8GlobalStateManager
+from .blockwise_gemm_sm100 import blockwise_grouped_gemm_sm100
 
 __all__ = [
     "general_gemm",
@@ -284,6 +285,17 @@ def general_grouped_gemm(
             torch.empty_like(o, dtype=bias_dtype, memory_format=torch.contiguous_format)
             for o in out
         ]  # this should differ with respect to single output
+
+    if (
+        isinstance(A[0], Float8BlockwiseQTensorStorage)
+        and getattr(FP8GlobalStateManager.get_fp8_recipe(), "use_f32_scales", False)
+        and get_device_compute_capability() >= (10, 0)
+    ):
+        assert not gelu, "GELU not supported in FP8 blockwise gemm with f32 scales."
+        assert not use_bias, "bias not supported in FP8 blockwise gemm with f32 scales."
+        # Swap A/B for cuteDSL kernels
+        blockwise_grouped_gemm_sm100(B, transb, A, transa, out, out_dtype, m_splits, accumulate)
+        return out, bias, gelu_input
 
     bias = tex.te_general_grouped_gemm(
         A,
