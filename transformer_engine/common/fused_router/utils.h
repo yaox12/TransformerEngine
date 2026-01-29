@@ -138,8 +138,8 @@ __device__ inline void apply_sqrtsoftplus_on_float(DataType *scores, int data_si
 // We need the original logits (x) to compute sigmoid, which we store in a separate buffer
 template <typename DataType>
 __device__ inline void apply_sqrtsoftplus_bwd_on_float(DataType *grad, DataType *fwd_output,
-                                                        DataType *logits_buf, int data_size,
-                                                        int lane_id) {
+                                                       DataType *logits_buf, int data_size,
+                                                       int lane_id) {
   for (int i = lane_id; i < data_size; i += kThreadsPerWarp) {
     float x = static_cast<float>(logits_buf[i]);  // original logit
     float y = static_cast<float>(fwd_output[i]);  // sqrtsoftplus output
