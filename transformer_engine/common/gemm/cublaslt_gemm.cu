@@ -952,6 +952,21 @@ void cublas_gemm_strided_batched(const Tensor *inputA, const Tensor *inputB, con
   if (use_mxfp8) {
     NVTE_CHECK(param.A_scale_inv != nullptr && param.B_scale_inv != nullptr,
                "MXFP8 inputs to strided batched GEMM require inverse scales.");
+#if CUBLAS_VERSION >= 120800
+    NVTE_CHECK(transformer_engine::cuda::cublas_version() >= 120800,
+               "MXFP8 strided batched GEMM requires cuBLAS 12.8+, but run-time cuBLAS version is ",
+               transformer_engine::cuda::cublas_version());
+#else
+    NVTE_ERROR(
+        "MXFP8 strided batched GEMM requires cuBLAS 12.8+, but compile-time cuBLAS version is ",
+        CUBLAS_VERSION);
+#endif  // CUBLAS_VERSION >= 120800
+    NVTE_CHECK(
+        inputA->with_gemm_swizzled_scales,
+        "MXFP8 A scales for strided batched GEMM must be packed by batch and GEMM-swizzled.");
+    NVTE_CHECK(
+        inputB->with_gemm_swizzled_scales,
+        "MXFP8 B scales for strided batched GEMM must be packed by batch and GEMM-swizzled.");
   }
   NVTE_CHECK(is_high_precision_dtype(outputD->data.dtype),
              "Strided batched GEMM currently supports high-precision output only.");
@@ -1045,15 +1060,6 @@ void cublas_gemm_strided_batched(const Tensor *inputA, const Tensor *inputB, con
 
   if (use_mxfp8) {
 #if CUBLAS_VERSION >= 120800
-    NVTE_CHECK(transformer_engine::cuda::cublas_version() >= 120800,
-               "MXFP8 strided batched GEMM requires cuBLAS 12.8+, but run-time cuBLAS version is ",
-               transformer_engine::cuda::cublas_version());
-    NVTE_CHECK(
-        inputA->with_gemm_swizzled_scales,
-        "MXFP8 A scales for strided batched GEMM must be packed by batch and GEMM-swizzled.");
-    NVTE_CHECK(
-        inputB->with_gemm_swizzled_scales,
-        "MXFP8 B scales for strided batched GEMM must be packed by batch and GEMM-swizzled.");
     fp8e8m0 *A_scale_inverse = reinterpret_cast<fp8e8m0 *>(param.A_scale_inv);
     fp8e8m0 *B_scale_inverse = reinterpret_cast<fp8e8m0 *>(param.B_scale_inv);
     NVTE_CHECK_CUBLAS(cublasLtMatmulDescSetAttribute(operationDesc,
@@ -1077,10 +1083,6 @@ void cublas_gemm_strided_batched(const Tensor *inputA, const Tensor *inputB, con
           operationDesc, CUBLASLT_MATMUL_DESC_ALPHA_VECTOR_BATCH_STRIDE, &dummy_a_vec_stride,
           sizeof(dummy_a_vec_stride)));
     }
-#else
-    NVTE_ERROR(
-        "MXFP8 strided batched GEMM requires cuBLAS 12.8+, but compile-time cuBLAS version is ",
-        CUBLAS_VERSION);
 #endif  // CUBLAS_VERSION >= 120800
   }
 

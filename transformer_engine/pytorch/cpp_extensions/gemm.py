@@ -301,6 +301,8 @@ def strided_batched_gemm(
     cuBLAS/TE convention as the C++ GEMM backend. For the common row-major
     ``layout="TN"`` case, this computes per batch:
     ``out[n, m] = B[n, k] @ A[m, k].T``.
+    ``out`` serves as both the C and D matrices, so accumulation applies
+    ``beta`` to the existing contents of ``out`` in place.
 
     Inputs must both be high-precision tensors or both be MXFP8 tensors. MXFP8
     inputs must use compact scales; the extension packs and GEMM-swizzles the

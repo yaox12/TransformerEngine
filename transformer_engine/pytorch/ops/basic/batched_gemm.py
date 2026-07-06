@@ -234,12 +234,12 @@ class BatchedGEMM(BasicOperation):
         self._configure_quantizer(self.get_quantizer("backward", 0))
 
     def _validate_input(self, input_: torch.Tensor) -> int:
-        if is_quantized_tensor(input_):
-            raise ValueError("BatchedGEMM expects a high-precision input tensor")
         if not isinstance(input_, torch.Tensor):
             raise TypeError(
                 f"BatchedGEMM expects a torch.Tensor input (got {type(input_).__name__})"
             )
+        if is_quantized_tensor(input_):
+            raise ValueError("BatchedGEMM expects a high-precision input tensor")
         if input_.device.type != "cuda":
             raise ValueError(f"BatchedGEMM requires a CUDA input tensor (got {input_.device})")
         if not devices_match(input_.device, self.weight.device):
