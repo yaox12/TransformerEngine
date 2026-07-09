@@ -6,7 +6,8 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
+import contextlib
 import math
 from typing import Optional
 
@@ -15,12 +16,21 @@ import torch
 from transformer_engine.common.recipe import Recipe
 
 from ...cpp_extensions import strided_batched_gemm
+from ...distributed import CudaRNGStatesTracker
 from ...module.base import _2X_ACC_DGRAD, _2X_ACC_FPROP, _2X_ACC_WGRAD
 from ...quantization import FP8GlobalStateManager, QuantizerRole
 from ...tensor import MXFP8Quantizer, Quantizer
 from ...tensor.storage.mxfp8_tensor_storage import MXFP8TensorStorage
 from ...utils import canonicalize_device, canonicalize_dtype, devices_match
-from .._common import is_quantized_tensor, maybe_autocast_dtype, maybe_dequantize
+from .._common import (
+    get_accumulate_flag_in_param,
+    get_dummy_wgrads_for_params,
+    get_main_grad_from_param,
+    is_quantized_tensor,
+    maybe_autocast_dtype,
+    maybe_dequantize,
+    view_main_grad_as_grouped_buffer,
+)
 from ..op import BasicOperation, OperationContext
 
 
@@ -56,6 +66,18 @@ class BatchedGEMM(BasicOperation):
         Weight device.
     dtype : torch.dtype, default = default dtype
         Weight datatype.
+    rng_state_tracker_function : callable, optional
+        Function that returns ``CudaRNGStatesTracker``, which is used for
+        weight initialization.
+    accumulate_into_main_grad : bool, default = False
+        Whether to directly accumulate weight gradients into the weight's
+        ``main_grad`` attribute instead of relying on PyTorch autograd. The
+        weight's ``main_grad`` must be set externally. Setting the weight's
+        ``overwrite_main_grad`` attribute to ``True`` overwrites ``main_grad``
+        instead of accumulating.
+    init_method : callable, optional
+        Method used to initialize the weight. The default is Kaiming uniform
+        initialization.
     """
 
     def __init__(
@@ -67,6 +89,9 @@ class BatchedGEMM(BasicOperation):
         batch_dim: int = -2,
         device: Optional[torch.device | str] = None,
         dtype: Optional[torch.dtype] = None,
+        rng_state_tracker_function: Optional[Callable[[], CudaRNGStatesTracker]] = None,
+        accumulate_into_main_grad: bool = False,
+        init_method: Optional[Callable] = None,
     ) -> None:
         super().__init__()
 
@@ -91,6 +116,10 @@ class BatchedGEMM(BasicOperation):
         dtype = canonicalize_dtype(dtype)
         if dtype not in (torch.float32, torch.float16, torch.bfloat16):
             raise ValueError(f"Supported dtypes are float32, float16, bfloat16 (got {dtype})")
+
+        self._rng_state_tracker_function = rng_state_tracker_function
+        self._accumulate_into_main_grad = accumulate_into_main_grad
+        self._init_method = init_method
 
         self._with_quantized_weight: bool = FP8GlobalStateManager.with_fp8_parameters()
         if self._with_quantized_weight:
@@ -118,7 +147,14 @@ class BatchedGEMM(BasicOperation):
             weight = torch.empty(weight.size(), dtype=weight.dtype, device=device)
         elif not devices_match(weight.device, device):
             weight = torch.empty_like(weight, device=device)
-        torch.nn.init.kaiming_uniform_(weight, a=math.sqrt(5))
+        init_context = contextlib.nullcontext()
+        if self._rng_state_tracker_function is not None:
+            init_context = self._rng_state_tracker_function().fork()
+        with init_context:
+            if self._init_method is None:
+                torch.nn.init.kaiming_uniform_(weight, a=math.sqrt(5))
+            else:
+                self._init_method(weight)
 
         if self._with_quantized_weight:
             quantizer = self.get_quantizer("forward", 1)
@@ -476,16 +512,42 @@ class BatchedGEMM(BasicOperation):
             )
 
         grad_weight = None
+        accumulate_wgrad = False
         if ctx.weight_requires_grad:
             if x is None:
                 raise RuntimeError("BatchedGEMM input was not saved for weight gradient")
-            grad_weight = torch.empty(
-                self.num_gemms,
-                self.out_features,
-                self.in_features,
-                dtype=ctx.dtype,
-                device=dy.device,
-            )
+            if self._accumulate_into_main_grad:
+                main_grad = get_main_grad_from_param(
+                    self.weight,
+                    op_label="BatchedGEMM",
+                ).detach()
+                grad_weight = view_main_grad_as_grouped_buffer(
+                    main_grad,
+                    self.num_gemms,
+                    (self.out_features, self.in_features),
+                    label="BatchedGEMM weight",
+                )
+                if not grad_weight.is_contiguous():
+                    raise RuntimeError("BatchedGEMM weight main_grad must be contiguous")
+                if not devices_match(grad_weight.device, dy.device):
+                    raise RuntimeError(
+                        "BatchedGEMM weight main_grad must be on the grad output device "
+                        f"(got {grad_weight.device} and {dy.device})"
+                    )
+                if grad_weight.dtype not in (torch.float32, torch.float16, torch.bfloat16):
+                    raise RuntimeError(
+                        "BatchedGEMM weight main_grad must have a high-precision dtype "
+                        f"(got {grad_weight.dtype})"
+                    )
+                accumulate_wgrad = get_accumulate_flag_in_param(self.weight)
+            else:
+                grad_weight = torch.empty(
+                    self.num_gemms,
+                    self.out_features,
+                    self.in_features,
+                    dtype=ctx.dtype,
+                    device=dy.device,
+                )
             lda, stridea = self._matrix_strides(ctx.rows, self.in_features)
             ldb, strideb = self._matrix_strides(ctx.rows, self.out_features)
             strided_batched_gemm(
@@ -503,7 +565,11 @@ class BatchedGEMM(BasicOperation):
                 ldd=self.in_features,
                 strided=self.out_features * self.in_features,
                 layout="NT",
+                accumulate=accumulate_wgrad,
                 use_split_accumulator=_2X_ACC_WGRAD,
             )
+
+        if ctx.weight_requires_grad and self._accumulate_into_main_grad:
+            grad_weight = get_dummy_wgrads_for_params([self.weight])[0]
 
         return grad_input, [grad_weight]

@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterable, Sequence
+import contextlib
 import io
 import os
 import math
@@ -1041,6 +1042,10 @@ class TestBasicOps:
     @pytest.mark.parametrize("batch_dim", (0, -2))
     @pytest.mark.parametrize("quantized_compute", (False, True))
     @pytest.mark.parametrize("quantized_weight", (False, True))
+    @pytest.mark.parametrize(
+        "accumulate_into_main_grad,overwrite_main_grad",
+        ((False, False), (True, False), (True, True)),
+    )
     def test_batched_gemm(
         self,
         monkeypatch: pytest.MonkeyPatch,
@@ -1048,6 +1053,8 @@ class TestBasicOps:
         batch_dim: int,
         quantized_compute: bool,
         quantized_weight: bool,
+        accumulate_into_main_grad: bool,
+        overwrite_main_grad: bool,
         dtype: torch.dtype = torch.bfloat16,
         device: torch.device = "cuda",
     ) -> None:
@@ -1100,9 +1107,17 @@ class TestBasicOps:
                 batch_dim=batch_dim,
                 device=device,
                 dtype=dtype,
+                accumulate_into_main_grad=accumulate_into_main_grad,
             )
         with torch.no_grad():
             op.weight.copy_(w_test)
+            op.weight.main_grad = torch.full(
+                op.weight.shape,
+                0.5,
+                dtype=torch.float32,
+                device=device,
+            )
+            op.weight.overwrite_main_grad = overwrite_main_grad
         if quantized_weight:
             assert isinstance(op.weight, QuantizedTensor)
             assert not op.weight._with_gemm_swizzled_scales
@@ -1110,7 +1125,7 @@ class TestBasicOps:
         original_strided_batched_gemm = batched_gemm_module.strided_batched_gemm
 
         def capture_strided_batched_gemm(*args, **kwargs):
-            gemm_calls.append((kwargs["layout"], args[0], args[1]))
+            gemm_calls.append((kwargs["layout"], args[0], args[1], kwargs.get("accumulate", False)))
             return original_strided_batched_gemm(*args, **kwargs)
 
         monkeypatch.setattr(
@@ -1130,18 +1145,38 @@ class TestBasicOps:
             tols = dtype_tols(dtype)
         assert_close(y_test, y_ref, **tols)
         assert_close_grads(x_test, x_ref, **tols)
-        assert_close(op.weight.grad, w_ref.grad, **tols)
+        if accumulate_into_main_grad:
+            if op.weight.grad is not None:
+                torch.testing.assert_close(
+                    op.weight.grad,
+                    torch.zeros_like(op.weight.grad),
+                    rtol=0,
+                    atol=0,
+                )
+            main_grad = op.weight.main_grad
+            if not overwrite_main_grad:
+                main_grad = main_grad - 0.5
+            assert_close(main_grad, w_ref.grad, **tols)
+        else:
+            assert_close(op.weight.grad, w_ref.grad, **tols)
+            torch.testing.assert_close(
+                op.weight.main_grad,
+                torch.full_like(op.weight.main_grad, 0.5),
+                rtol=0,
+                atol=0,
+            )
 
-        assert [layout for layout, _, _ in gemm_calls] == ["TN", "NN", "NT"]
+        assert [layout for layout, _, _, _ in gemm_calls] == ["TN", "NN", "NT"]
+        assert gemm_calls[-1][3] == (accumulate_into_main_grad and not overwrite_main_grad)
         if quantized_compute:
 
             def assert_mxfp8_usage(tensor, *, rowwise: bool, columnwise: bool) -> None:
                 assert (tensor._rowwise_data is not None) == rowwise
                 assert (tensor._columnwise_data is not None) == columnwise
 
-            _, fprop_weight, fprop_input = gemm_calls[0]
-            _, dgrad_weight, dgrad_dy = gemm_calls[1]
-            _, wgrad_input, wgrad_dy = gemm_calls[2]
+            _, fprop_weight, fprop_input, _ = gemm_calls[0]
+            _, dgrad_weight, dgrad_dy, _ = gemm_calls[1]
+            _, wgrad_input, wgrad_dy, _ = gemm_calls[2]
             assert_mxfp8_usage(fprop_weight, rowwise=True, columnwise=True)
             assert_mxfp8_usage(fprop_input, rowwise=True, columnwise=True)
             assert_mxfp8_usage(dgrad_weight, rowwise=True, columnwise=True)
@@ -1154,6 +1189,51 @@ class TestBasicOps:
             if quantized_weight:
                 assert fprop_weight is op.weight
                 assert not op.weight._with_gemm_swizzled_scales
+
+    @pytest.mark.parametrize("deferred_init", (False, True))
+    def test_batched_gemm_init_method_and_rng_tracker(self, deferred_init: bool) -> None:
+        events = []
+
+        class TestRNGTracker:
+            @contextlib.contextmanager
+            def fork(self):
+                events.append("enter")
+                try:
+                    yield
+                finally:
+                    events.append("exit")
+
+        tracker = TestRNGTracker()
+
+        def get_rng_tracker():
+            events.append("tracker")
+            return tracker
+
+        def init_method(weight):
+            assert events[-1] == "enter"
+            events.append("init")
+            torch.nn.init.constant_(weight, 0.25)
+
+        op = te_ops.BatchedGEMM(
+            2,
+            32,
+            64,
+            device="meta" if deferred_init else "cuda",
+            dtype=torch.bfloat16,
+            rng_state_tracker_function=get_rng_tracker,
+            init_method=init_method,
+        )
+        if deferred_init:
+            assert events == []
+            op.reset_parameters()
+
+        assert events == ["tracker", "enter", "init", "exit"]
+        torch.testing.assert_close(
+            op.weight,
+            torch.full_like(op.weight, 0.25),
+            rtol=0,
+            atol=0,
+        )
 
     def test_batched_gemm_quantized_weight_inference(self) -> None:
         maybe_skip_quantization("mxfp8", device="cuda", dtype=torch.bfloat16)
